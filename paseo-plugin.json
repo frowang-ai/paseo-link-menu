@@ -1,0 +1,7 @@
+{
+  "id": "link-menu",
+  "description": "Right-click a link in a chat to copy the address behind it, the raw Markdown href or file path",
+  "requirements": {
+    "paseo": ">=0.10.1"
+  }
+}

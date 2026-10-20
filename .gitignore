@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.npmrc
+*.log
+*.tgz
+.DS_Store
+Thumbs.db
+.paseo/
+.pi/
+.local/
