@@ -288,6 +288,9 @@ button.failed { color: var(--lm-danger); }
   border-radius: 6px;
   background: var(--lm-hover);
   color: var(--lm-muted);
+}
+/* Keep padding outside the clamped box so it cannot reveal a third line. */
+.addr-text {
   font-size: 11.5px;
   line-height: 15px;
   overflow-wrap: anywhere;
@@ -302,7 +305,7 @@ const MARKUP = `
 <style>${STYLE}</style>
 <div class="menu" role="menu" aria-label="Link">
   <button data-action="copy">${svg(ICON.link)}<span class="label"></span></button>
-  <div class="addr"></div>
+  <div class="addr"><div class="addr-text"></div></div>
 </div>
 `;
 
@@ -361,7 +364,7 @@ export function installLinkMenu(): () => void {
   shadow.innerHTML = MARKUP;
   const menu = shadow.querySelector(".menu")!;
   const button = shadow.querySelector('[data-action="copy"]') as DomButton;
-  const addr = shadow.querySelector(".addr")!;
+  const addr = shadow.querySelector(".addr-text")!;
   document.body.appendChild(host);
 
   let open = false;
