@@ -1,6 +1,6 @@
 {
   "id": "link-menu",
-  "description": "Right-click a link in a chat to copy the address behind it, the raw Markdown href or file path",
+  "description": "Right-click a chat link to copy its address or reveal a local file in your desktop file manager",
   "requirements": {
     "paseo": ">=0.10.1"
   }

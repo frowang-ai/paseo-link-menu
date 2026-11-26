@@ -1,8 +1,11 @@
+import { getPaseoClient } from "@getpaseo/plugin/client";
 import { copyText } from "@getpaseo/plugin/client/react-native";
 import { Platform } from "react-native";
+import { parseFileLink, parseWorkspaceRoute, type WorkspaceRoute } from "./file-link";
+import { prepareLocalReveal, warmLocalReveal, type DesktopFileBridge, type RevealInput } from "./reveal";
 
 /*
- * Right-click a link in a chat, get a menu that copies the address behind it.
+ * Right-click a chat link to copy its address or reveal a local file in the system file manager.
  *
  * Web and desktop only. Mobile chat links are native text spans, not anchors.
  *
@@ -26,6 +29,13 @@ import { Platform } from "react-native";
 const CHAT_SCROLL = '[data-testid="agent-chat-scroll"]';
 /** Chat links are real anchors; the href attribute holds the raw Markdown target. */
 const ANCHOR = "a[href]";
+const MENU_HOST = "[data-paseo-link-menu]";
+const SHARED = Symbol.for("frowang.paseo-link-menu.installation.v1");
+type DirectoryReader = (route: WorkspaceRoute) => Promise<string | null>;
+interface MenuInstallation {
+  readers: Map<symbol, DirectoryReader>;
+  dispose(): void;
+}
 
 // ---------------------------------------------------------------------------
 // Minimal DOM declarations; the plugin typechecks without the DOM library.
@@ -35,6 +45,7 @@ interface DomEvent {
   readonly target: DomNode | null;
   preventDefault(): void;
   stopPropagation(): void;
+  stopImmediatePropagation(): void;
 }
 
 interface DomMouseEvent extends DomEvent {
@@ -76,6 +87,7 @@ interface DomElement extends DomNode {
   readonly offsetHeight: number;
   textContent: string | null;
   innerHTML: string;
+  hidden: boolean;
   closest(selector: string): DomElement | null;
   querySelector(selector: string): DomElement | null;
   querySelectorAll(selector: string): Array<DomElement>;
@@ -107,6 +119,8 @@ interface DomSelection {
 }
 
 declare const window: DomEventTarget & {
+  readonly location: { pathname: string; hash: string };
+  readonly paseoDesktop?: DesktopFileBridge;
   readonly innerWidth: number;
   readonly innerHeight: number;
   getSelection(): DomSelection | null;
@@ -117,18 +131,34 @@ declare const window: DomEventTarget & {
 };
 declare const document: DomEventTarget & {
   readonly body: DomElement;
+  querySelectorAll(selector: string): ArrayLike<DomElement>;
   createElement(tag: "div"): DomElement;
+  [key: symbol]: MenuInstallation | undefined;
 };
 declare const navigator: { readonly language: string };
 
 // ---------------------------------------------------------------------------
 // Labels
 
-const ZH = navigator.language?.toLowerCase().startsWith("zh") ?? false;
+const ZH = typeof navigator !== "undefined" && (navigator.language?.toLowerCase().startsWith("zh") ?? false);
 const LABEL = {
   copy: ZH ? "复制链接地址" : "Copy link address",
   copied: ZH ? "已复制" : "Copied",
   failed: ZH ? "复制失败" : "Copy failed",
+  reveal: ZH ? "在文件管理器中显示" : "Show in file manager",
+  explorer: ZH ? "在资源管理器中显示" : "Show in Explorer",
+  finder: ZH ? "在 Finder 中显示" : "Show in Finder",
+  checking: ZH ? "正在准备打开位置…" : "Preparing file location…",
+  opening: ZH ? "正在打开文件位置…" : "Opening file location…",
+  revealed: ZH ? "已打开文件位置" : "File location opened",
+  revealFailed: ZH ? "打开失败，可重试" : "Could not open; retry",
+  missing: ZH ? "文件或文件夹不存在：" : "File or folder does not exist: ",
+  checkFailed: ZH ? "无法确认文件位置，请关闭菜单后重试。" : "Could not check the file location. Reopen the menu to retry.",
+  openFailed: ZH ? "请确认文件仍在原位置且可以访问，然后重试。" : "Check that the file still exists and is accessible, then retry.",
+  unavailable: ZH ? "当前桌面端不支持此操作" : "Unavailable in this desktop client",
+  "unknown-workspace": ZH ? "无法确认链接所属的工作区" : "Could not identify the link's workspace",
+  remote: ZH ? "这是远程主机的文件，无法在本机定位" : "This file belongs to a remote host",
+  "unsupported-path": ZH ? "无法解析为本机文件路径" : "Could not resolve a local file path",
 } as const;
 
 /** The address as the user wrote it: undo the renderer's percent-encoding. */
@@ -235,6 +265,7 @@ function applyPalette(host: DomElement, anchor: DomElement): void {
 
 const ICON = {
   link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  folder: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v1"/><path d="M3 7h18l-3 14H3z"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
   x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
 } as const;
@@ -246,6 +277,7 @@ function svg(paths: string): string {
 const STYLE = `
 :host { all: initial; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 .menu {
   min-width: 180px;
   max-width: min(360px, calc(100vw - 16px));
@@ -279,9 +311,12 @@ button {
   white-space: nowrap;
   cursor: pointer;
 }
-button:hover { background: var(--lm-hover); }
+button:hover:not(:disabled) { background: var(--lm-hover); }
+button:disabled { opacity: 0.6; cursor: default; }
 button.done { color: var(--lm-muted); }
 button.failed { color: var(--lm-danger); }
+.status { margin: 4px 9px; font-size: 11.5px; color: var(--lm-muted); white-space: normal; overflow-wrap: anywhere; }
+.status.failed { color: var(--lm-danger); }
 .addr {
   margin: 2px 4px 3px;
   padding: 5px 7px;
@@ -305,6 +340,8 @@ const MARKUP = `
 <style>${STYLE}</style>
 <div class="menu" role="menu" aria-label="Link">
   <button data-action="copy">${svg(ICON.link)}<span class="label"></span></button>
+  <button data-action="reveal" hidden>${svg(ICON.folder)}<span class="label"></span></button>
+  <div class="status" role="status" hidden></div>
   <div class="addr"><div class="addr-text"></div></div>
 </div>
 `;
@@ -315,6 +352,25 @@ const FLASH_MS = 700;
 interface Current {
   /** The raw Markdown href, percent-decoded for display and copying. */
   address: string;
+  route: WorkspaceRoute | null;
+  anchor: DomElement;
+  bridge?: DesktopFileBridge;
+  revealInput?: RevealInput;
+}
+
+function workspaceRoute(): WorkspaceRoute | null {
+  const path = window.location.hash.startsWith("#/h/")
+    ? window.location.hash.slice(1) : window.location.pathname;
+  return parseWorkspaceRoute(path);
+}
+
+function sameRoute(left: WorkspaceRoute | null, right: WorkspaceRoute | null): boolean {
+  return Boolean(left && right && left.serverId === right.serverId && left.workspaceId === right.workspaceId);
+}
+
+async function readWorkspaceDirectory(route: WorkspaceRoute): Promise<string | null> {
+  const workspace = getPaseoClient(route.serverId).workspaces.ref(route.workspaceId);
+  return workspace.directory ?? (await workspace.refresh())?.workspaceDirectory ?? null;
 }
 
 function elementOf(node: DomNode | null): DomElement | null {
@@ -343,9 +399,40 @@ function selectionCovers(anchor: DomElement): boolean {
   }
 }
 
-/** Installs the link menu. Returns cleanup; a no-op off the web. */
+/** One menu per page, even when multiple connected hosts contribute this plugin. */
 export function installLinkMenu(): () => void {
   if (Platform.OS !== "web" || typeof document === "undefined") return () => {};
+  let installation = document[SHARED];
+  if (!installation) {
+    const readers = new Map<symbol, DirectoryReader>();
+    installation = {
+      readers,
+      dispose: mountLinkMenu((route) => {
+        // Use a live installation's SDK. The first owner's API may have been disposed.
+        const readDirectory = Array.from(readers.values()).at(-1);
+        return readDirectory ? readDirectory(route) : Promise.resolve(null);
+      }),
+    };
+    document[SHARED] = installation;
+  }
+  const owner = Symbol();
+  installation.readers.set(owner, readWorkspaceDirectory);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    installation.readers.delete(owner);
+    if (installation.readers.size === 0) {
+      installation.dispose();
+      if (document[SHARED] === installation) delete document[SHARED];
+    }
+  };
+}
+
+function mountLinkMenu(readDirectory: DirectoryReader): () => void {
+  void warmLocalReveal(window.paseoDesktop).catch(() => {
+    // A startup failure is retried by the next menu request, which displays its error.
+  });
 
   const host = document.createElement("div");
   host.setAttribute("data-paseo-link-menu", "");
@@ -364,12 +451,15 @@ export function installLinkMenu(): () => void {
   shadow.innerHTML = MARKUP;
   const menu = shadow.querySelector(".menu")!;
   const button = shadow.querySelector('[data-action="copy"]') as DomButton;
+  const revealButton = shadow.querySelector('[data-action="reveal"]') as DomButton;
+  const status = shadow.querySelector(".status")!;
   const addr = shadow.querySelector(".addr-text")!;
   document.body.appendChild(host);
 
   let open = false;
   let current: Current | null = null;
   let flashTimer = 0;
+  let menuPosition = { x: GAP, y: GAP };
 
   const hide = () => {
     window.clearTimeout(flashTimer);
@@ -390,18 +480,61 @@ export function installLinkMenu(): () => void {
   const show = (anchor: DomElement, x: number, y: number) => {
     const raw = anchor.getAttribute("href");
     if (!raw) return;
-    current = { address: displayAddress(raw) };
+    window.clearTimeout(flashTimer);
+    menuPosition = { x, y };
+    const snapshot: Current = { address: displayAddress(raw), route: workspaceRoute(), anchor, bridge: window.paseoDesktop };
+    current = snapshot;
     open = true;
+    button.disabled = false;
     button.className = "";
     button.innerHTML = `${svg(ICON.link)}<span class="label"></span>`;
     button.querySelector(".label")!.textContent = LABEL.copy;
-    addr.textContent = current.address;
+    status.hidden = true;
+    status.className = "status";
+    status.textContent = "";
+    revealButton.hidden = true;
+    revealButton.disabled = true;
+    revealButton.className = "";
+    revealButton.innerHTML = `${svg(ICON.folder)}<span class="label"></span>`;
+    addr.textContent = snapshot.address;
     applyPalette(host, anchor);
     host.style.setProperty("display", "block", "important");
+    const target = parseFileLink(raw);
+    const bridge = snapshot.bridge;
+    if (target && bridge?.editor?.openTarget && bridge.invoke) {
+      revealButton.hidden = false;
+      revealButton.querySelector(".label")!.textContent = LABEL.checking;
+      void prepareLocalReveal({ bridge, route: snapshot.route, target, readDirectory }).then(
+        (result) => {
+          if (!open || current !== snapshot) return;
+          if (!sameRoute(snapshot.route, workspaceRoute())) {
+            revealButton.querySelector(".label")!.textContent = LABEL["unknown-workspace"];
+          } else if (result.ready) {
+            snapshot.revealInput = result.input;
+            revealButton.disabled = false;
+            revealButton.querySelector(".label")!.textContent = bridge.platform === "win32" ? LABEL.explorer : bridge.platform === "darwin" ? LABEL.finder : LABEL.reveal;
+          } else {
+            revealButton.querySelector(".label")!.textContent = LABEL.reveal;
+            status.hidden = false;
+            status.textContent = LABEL[result.reason];
+          }
+          place(x, y);
+        },
+        (_error: unknown) => {
+          if (!open || current !== snapshot) return;
+          revealButton.querySelector(".label")!.textContent = LABEL.unavailable;
+          status.hidden = false;
+          status.className = "status failed";
+          status.textContent = LABEL.checkFailed;
+          place(x, y);
+        },
+      );
+    }
     place(x, y);
   };
 
   const flash = (kind: "done" | "failed") => {
+    button.disabled = false;
     button.className = kind;
     button.innerHTML = `${svg(kind === "done" ? ICON.check : ICON.x)}<span class="label"></span>`;
     button.querySelector(".label")!.textContent = kind === "done" ? LABEL.copied : LABEL.failed;
@@ -410,11 +543,42 @@ export function installLinkMenu(): () => void {
   };
 
   const copy = () => {
-    if (!current) return;
-    const address = current.address;
-    void copyText(address).then(
-      () => flash("done"),
-      () => flash("failed"),
+    if (!current || button.disabled) return;
+    const snapshot = current;
+    button.disabled = true;
+    void copyText(snapshot.address).then(
+      () => { if (open && current === snapshot) flash("done"); },
+      () => { if (open && current === snapshot) flash("failed"); },
+    );
+  };
+
+  const reveal = () => {
+    const snapshot = current;
+    if (!snapshot?.revealInput || !snapshot.bridge?.editor?.openTarget || revealButton.disabled) return;
+    if (!sameRoute(snapshot.route, workspaceRoute()) || !document.body.contains(snapshot.anchor)) { hide(); return; }
+    window.clearTimeout(flashTimer);
+    revealButton.disabled = true;
+    revealButton.className = "";
+    revealButton.querySelector(".label")!.textContent = LABEL.opening;
+    status.hidden = true;
+    void snapshot.bridge.editor.openTarget(snapshot.revealInput).then(
+      () => {
+        if (!open || current !== snapshot) return;
+        revealButton.className = "done";
+        revealButton.querySelector(".label")!.textContent = LABEL.revealed;
+        flashTimer = window.setTimeout(hide, FLASH_MS);
+      },
+      (error: unknown) => {
+        if (!open || current !== snapshot) return;
+        revealButton.disabled = false;
+        revealButton.className = "failed";
+        revealButton.querySelector(".label")!.textContent = LABEL.revealFailed;
+        status.className = "status failed";
+        status.hidden = false;
+        const missingPath = error instanceof Error ? /Path does not exist:\s*(.+)$/.exec(error.message)?.[1] : null;
+        status.textContent = missingPath ? LABEL.missing + missingPath : LABEL.openFailed;
+        place(menuPosition.x, menuPosition.y);
+      },
     );
   };
 
@@ -423,7 +587,12 @@ export function installLinkMenu(): () => void {
     const anchor = linkAt(event.target, host);
     if (!anchor || selectionCovers(anchor)) return;
     event.preventDefault();
-    event.stopPropagation();
+    // Older host copies listen on document. Claim the event in window's capture
+    // phase before those copies can open a second menu over this one.
+    event.stopImmediatePropagation();
+    for (const other of Array.from(document.querySelectorAll(MENU_HOST))) {
+      if (other !== host) other.style.setProperty("display", "none", "important");
+    }
     show(anchor, event.clientX, event.clientY);
   };
 
@@ -431,7 +600,9 @@ export function installLinkMenu(): () => void {
     event.preventDefault();
   };
   const onMenuClick: DomListener = (event) => {
-    if (elementOf(event.target)?.closest('[data-action="copy"]')) copy();
+    const action = elementOf(event.target)?.closest("button[data-action]")?.getAttribute("data-action");
+    if (action === "copy") copy();
+    if (action === "reveal") reveal();
   };
   menu.addEventListener("mousedown", onMenuPointerDown);
   menu.addEventListener("click", onMenuClick);
@@ -454,15 +625,15 @@ export function installLinkMenu(): () => void {
     if (open) hide();
   };
 
-  document.addEventListener("contextmenu", onContextMenu, true);
+  window.addEventListener("contextmenu", onContextMenu, true);
   document.addEventListener("pointerdown", onPointerDown, true);
   document.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("scroll", onViewportChange, true);
   window.addEventListener("resize", onViewportChange);
 
   return () => {
-    window.clearTimeout(flashTimer);
-    document.removeEventListener("contextmenu", onContextMenu, true);
+    hide();
+    window.removeEventListener("contextmenu", onContextMenu, true);
     document.removeEventListener("pointerdown", onPointerDown, true);
     document.removeEventListener("keydown", onKeyDown, true);
     window.removeEventListener("scroll", onViewportChange, true);

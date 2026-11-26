@@ -1,6 +1,6 @@
 {
   "name": "paseo-link-menu",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "files": [
     "paseo-plugin.json",
     "index.client.tsx",
@@ -10,7 +10,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.10.1",
@@ -19,7 +20,7 @@
     "react-native": "0.81.5",
     "typescript": "^5.9.3"
   },
-  "description": "Right-click a link in a Paseo chat to copy the address behind it",
+  "description": "Copy chat link addresses or reveal local files in your desktop file manager",
   "license": "MIT",
   "repository": {
     "type": "git",
