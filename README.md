@@ -1,6 +1,14 @@
 # Paseo Link Menu
 
+English | [简体中文](README.zh-CN.md)
+
 Right-click a link in a Paseo chat to copy its underlying address or reveal a local file in your desktop file manager. On Windows, **在资源管理器中显示** / **Show in Explorer** opens the containing folder and selects the file, so you can open videos, presentations, PDFs, and other files with your normal applications. Left-clicking links keeps Paseo's normal behavior.
+
+## Preview
+
+![English menu with Copy link address and Show in Explorer](docs/images/link-menu-en.png)
+
+Right-click a local file link, then choose **Show in Explorer** to open its folder and select the file. The screenshot runs the actual plugin menu with sample chat content and a simulated desktop bridge; it illustrates the menu, not an Explorer launch. [中文截图与说明](README.zh-CN.md#效果预览).
 
 ## Install
 
